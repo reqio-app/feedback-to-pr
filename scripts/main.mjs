@@ -14,6 +14,7 @@ import {
 } from "./reqio.mjs";
 import { buildBrief } from "./prompt.mjs";
 
+const DEFAULT_AGENT_COMMAND = "npx -y @anthropic-ai/claude-code@latest -p";
 const WORK_DIR = ".reqio-agent";
 const QUESTIONS_FILE = path.join(WORK_DIR, "questions.md");
 
@@ -106,8 +107,27 @@ const agentEnv = () => {
   return env;
 };
 
+/**
+ * An OMITTED agent-command means "use the default". An explicitly EMPTY one
+ * means the user picked a non-default agent and has not pasted its invocation
+ * yet, so falling back to the default would launch Claude Code against, say,
+ * an OPENAI_API_KEY and fail deep in the run with an unrelated-looking error.
+ * `||` cannot tell those apart because "" is falsy; `??` plus a trim check can.
+ */
+const resolveAgentCommand = () => {
+  const raw = process.env.REQIO_AGENT_COMMAND ?? DEFAULT_AGENT_COMMAND;
+  const command = raw.trim();
+  if (!command) {
+    throw new Error(
+      "agent-command is empty. Set it to your coding agent's headless invocation, " +
+        "or remove the input entirely to use the default (Claude Code).",
+    );
+  }
+  return command;
+};
+
 const runAgent = (brief) => {
-  const command = process.env.REQIO_AGENT_COMMAND || "npx -y @anthropic-ai/claude-code@latest -p";
+  const command = resolveAgentCommand();
   try {
     const out = execSync(command, {
       input: brief,
@@ -295,6 +315,10 @@ const runPoll = async (cfg) => {
       shQuiet("gh repo view --json defaultBranchRef -q .defaultBranchRef.name").out ||
       "main",
   };
+
+  // Validate before touching the network or git: a misconfigured command should
+  // fail on an empty run, not after branching and opening a pull request.
+  resolveAgentCommand();
 
   const approved = await listFeatures(cfg, { status: "IN_PROGRESS", category: "ERROR" });
   const pending = opts.autoApprove
