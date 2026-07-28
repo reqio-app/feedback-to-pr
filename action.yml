@@ -1,0 +1,92 @@
+name: "Reqio feedback to pull request"
+description: "Turns approved Reqio bug reports into pull requests, and tells the reporter when you merge."
+author: "Reqio"
+
+branding:
+  icon: "git-pull-request"
+  color: "blue"
+
+inputs:
+  mode:
+    description: "poll (find approved bugs and open pull requests) or merged (close the loop after a merge)."
+    required: false
+    default: "poll"
+  project-id:
+    description: "Your Reqio project id."
+    required: true
+  base-url:
+    description: "Reqio base URL, no trailing slash."
+    required: false
+    default: "https://reqio.app"
+  branch-prefix:
+    description: "Branch namespace. The feature id is appended, and that branch IS the claim that a bug is already handled."
+    required: false
+    default: "reqio/feature-"
+
+  # poll mode
+  auto-approve:
+    description: "false: only bugs the team moved to In progress. true: also picks up new bugs, and the pull request becomes the only approval."
+    required: false
+    default: "false"
+  max-prs-per-run:
+    description: "Guard against a backlog flood turning into a review avalanche."
+    required: false
+    default: "3"
+  test-command:
+    description: "Runs inside this job before the pull request opens. Your own CI cannot run on a token-created PR, so this is the check the reviewer reads."
+    required: false
+    default: ""
+  allow-test-edits:
+    description: "false keeps the agent out of test files. An agent that can edit the suite can make anything pass."
+    required: false
+    default: "false"
+  agent-command:
+    description: "Coding agent CLI. Receives the brief on stdin and edits the checkout in place."
+    required: false
+    default: "npx -y @anthropic-ai/claude-code@latest -p"
+  base-branch:
+    description: "Branch to cut from. Defaults to the repository default branch."
+    required: false
+    default: ""
+
+  # merged mode
+  branch:
+    description: "Head branch of the merged pull request. The feature id is parsed from it."
+    required: false
+    default: ""
+  completion-kind:
+    description: "SHIPPED if merging deploys, NEXT_UPDATE if it lands in a later release. This is what the reporter is told."
+    required: false
+    default: "NEXT_UPDATE"
+
+  github-token:
+    description: "Token used to push the branch and open the pull request."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  handled:
+    description: "Number of requests acted on."
+    value: ${{ steps.run.outputs.handled }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/scripts/main.mjs"
+      env:
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
+        REQIO_MODE: ${{ inputs.mode }}
+        REQIO_PROJECT_ID: ${{ inputs.project-id }}
+        REQIO_BASE_URL: ${{ inputs.base-url }}
+        REQIO_BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        REQIO_AUTO_APPROVE: ${{ inputs.auto-approve }}
+        REQIO_MAX_PRS: ${{ inputs.max-prs-per-run }}
+        REQIO_TEST_COMMAND: ${{ inputs.test-command }}
+        REQIO_ALLOW_TEST_EDITS: ${{ inputs.allow-test-edits }}
+        REQIO_AGENT_COMMAND: ${{ inputs.agent-command }}
+        REQIO_BASE_BRANCH: ${{ inputs.base-branch }}
+        REQIO_BRANCH: ${{ inputs.branch }}
+        REQIO_COMPLETION_KIND: ${{ inputs.completion-kind }}
+        GH_TOKEN: ${{ inputs.github-token }}

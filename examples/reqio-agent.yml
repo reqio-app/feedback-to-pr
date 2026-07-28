@@ -1,0 +1,33 @@
+name: Reqio agent
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: reqio-agent
+  cancel-in-progress: false
+
+jobs:
+  open-pull-requests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: reqio-app/feedback-to-pr@v1
+        with:
+          project-id: YOUR_PROJECT_ID
+          base-url: https://reqio.app
+          branch-prefix: "reqio/feature-"
+          auto-approve: "false"
+          max-prs-per-run: "3"
+          test-command: ""
+          allow-test-edits: "false"
+        env:
+          REQIO_API_KEY: ${{ secrets.REQIO_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

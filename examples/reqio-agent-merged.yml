@@ -1,0 +1,28 @@
+name: Reqio agent (merged)
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  close-the-loop:
+    # The branch test is a cost guard: this trigger fires for every merged pull
+    # request, and a job that starts only to exit still bills a whole minute on
+    # a private repo. A false job-level `if` never claims a runner.
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.repo.fork == false && startsWith(github.event.pull_request.head.ref, 'reqio/feature-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: reqio-app/feedback-to-pr@v1
+        with:
+          mode: merged
+          project-id: YOUR_PROJECT_ID
+          base-url: https://reqio.app
+          branch-prefix: "reqio/feature-"
+          branch: ${{ github.event.pull_request.head.ref }}
+          completion-kind: NEXT_UPDATE
+        env:
+          REQIO_API_KEY: ${{ secrets.REQIO_API_KEY }}
