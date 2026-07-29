@@ -14,7 +14,12 @@ import {
 } from "./reqio.mjs";
 import { buildBrief } from "./prompt.mjs";
 
-const DEFAULT_AGENT_COMMAND = "npx -y @anthropic-ai/claude-code@latest -p";
+// bypassPermissions is not optional in CI: -p alone still enforces permission
+// checks, and a prompt the agent cannot display is a refusal to edit anything.
+// Every supported agent needs its own version of this (Codex bypasses its
+// sandbox, Gemini runs yolo) because none of them can ask a human here.
+const DEFAULT_AGENT_COMMAND =
+  "npx -y @anthropic-ai/claude-code@latest -p --permission-mode bypassPermissions";
 const WORK_DIR = ".reqio-agent";
 const QUESTIONS_FILE = path.join(WORK_DIR, "questions.md");
 
@@ -89,12 +94,42 @@ const isWorkable = (feature) => {
   return !AGENT_AUTHORED_NOTE_PREFIXES.some((prefix) => note.startsWith(prefix));
 };
 
-const alreadyHandled = (branch) => {
-  const remote = shQuiet(`git ls-remote --heads origin ${branch}`);
-  if (remote.ok && remote.out) return true;
-  // A merged-and-deleted branch leaves no ref, so ask for PRs in any state.
-  const prs = shQuiet(`gh pr list --head ${branch} --state all --json number --limit 1`);
-  return prs.ok && prs.out.trim() !== "" && prs.out.trim() !== "[]";
+/** The pull request on this branch, in any state, or null if there is none. */
+const findPullRequest = (branch) => {
+  const listed = shQuiet(
+    `gh pr list --head ${branch} --state all --json number,url,state,isDraft --limit 1`,
+  );
+  if (!listed.ok) return null;
+  const body = listed.out.trim();
+  if (!body || body === "[]") return null;
+  try {
+    const [pr] = JSON.parse(body);
+    return pr ?? null;
+  } catch {
+    // Unparseable output is not evidence of absence. Report a claim so a
+    // duplicate is never opened on a guess.
+    return { number: null, url: null, state: "UNKNOWN", isDraft: false };
+  }
+};
+
+/**
+ * Whether this request is spoken for. The branch is still the claim, but a
+ * DRAFT pull request is not a claim - it is an unfinished attempt, and the
+ * whole point of the questions flow is that a later run reads the reporter's
+ * answer and resumes from that draft. Treating any pull request as final broke
+ * that, and made a transient failure (a missing credential, a sandbox that
+ * cannot start) cost the request permanently: the tombstone it left behind
+ * could never be retried.
+ *
+ * So: a draft is retryable, a ready or merged or closed pull request is not.
+ * A leftover branch with no pull request is retryable too - it means an earlier
+ * run pushed and then failed to open one, which is exactly what happens when
+ * the repository has not allowed Actions to create pull requests yet.
+ */
+const claimFor = (branch) => {
+  const pr = findPullRequest(branch);
+  if (pr) return { handled: !(pr.state === "OPEN" && pr.isDraft), pr };
+  return { handled: false, pr: null };
 };
 
 const prepareWorkDir = (feature, screenshot) => {
@@ -232,10 +267,19 @@ const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFaile
 
 const handleOne = async (cfg, summary, opts) => {
   const branch = `${opts.branchPrefix}${summary.id}`;
-  if (alreadyHandled(branch)) {
+  const claim = claimFor(branch);
+  if (claim.handled) {
     console.log(`[reqio] ${summary.id} already has ${branch}, skipping.`);
     return false;
   }
+  if (claim.pr) {
+    console.log(`[reqio] ${summary.id} has an unfinished draft, resuming ${claim.pr.url}`);
+  }
+
+  // Retrying an existing branch force-pushes over it, and --force-with-lease
+  // needs a remote-tracking ref to lease against or it refuses on stale info.
+  // Absent (a first attempt) is fine; the lease simply has nothing to compare.
+  shQuiet(`git fetch origin ${branch}:refs/remotes/origin/${branch} --force`);
 
   const feature = await getFeature(cfg, summary.id);
   if (!isWorkable(feature)) {
@@ -311,14 +355,38 @@ const handleOne = async (cfg, summary, opts) => {
   const bodyFile = path.join(process.env.RUNNER_TEMP || ".", `reqio-pr-${feature.id}.md`);
   writeFileSync(bodyFile, body);
 
-  const created = shQuiet(
-    `gh pr create --base ${opts.baseBranch} --head ${branch} --title "${subject.replace(/"/g, '\\"')}" --body-file "${bodyFile}"${draft ? " --draft" : ""}`,
-  );
-  if (!created.ok) {
-    console.error(`[reqio] could not open a pull request for ${feature.id}: ${created.out}`);
-    return false;
+  const quotedTitle = `"${subject.replace(/"/g, '\\"')}"`;
+  let prUrl;
+
+  if (claim.pr) {
+    // Resuming the draft this run inherited: the force-push already replaced
+    // its commits, so only the title, body and draft state still need to catch
+    // up with the new outcome. Opening a second pull request on the same head
+    // is not possible anyway.
+    const edited = shQuiet(
+      `gh pr edit ${claim.pr.number} --title ${quotedTitle} --body-file "${bodyFile}"`,
+    );
+    if (!edited.ok) {
+      console.error(`[reqio] could not update pull request for ${feature.id}: ${edited.out}`);
+      return false;
+    }
+    // An attempt that now has code and no open questions has stopped being a
+    // draft, and nobody will review what still looks unfinished.
+    if (!draft) {
+      const ready = shQuiet(`gh pr ready ${claim.pr.number}`);
+      if (!ready.ok) console.error(`[reqio] could not mark ${claim.pr.url} ready: ${ready.out}`);
+    }
+    prUrl = claim.pr.url;
+  } else {
+    const created = shQuiet(
+      `gh pr create --base ${opts.baseBranch} --head ${branch} --title ${quotedTitle} --body-file "${bodyFile}"${draft ? " --draft" : ""}`,
+    );
+    if (!created.ok) {
+      console.error(`[reqio] could not open a pull request for ${feature.id}: ${created.out}`);
+      return false;
+    }
+    prUrl = created.out.split("\n").filter(Boolean).pop();
   }
-  const prUrl = created.out.split("\n").filter(Boolean).pop();
 
   const note = questions
     ? `${QUESTIONS_MARKER}\n${questions}\n\nDraft pull request: ${prUrl}`
