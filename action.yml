@@ -43,7 +43,7 @@ inputs:
   agent-command:
     description: "Coding agent CLI. Receives the brief on stdin and edits the checkout in place."
     required: false
-    default: "npx -y @anthropic-ai/claude-code@latest -p"
+    default: "npx -y @anthropic-ai/claude-code@latest -p --permission-mode bypassPermissions"
   base-branch:
     description: "Branch to cut from. Defaults to the repository default branch."
     required: false
