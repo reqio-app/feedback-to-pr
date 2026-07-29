@@ -66,6 +66,29 @@ const runMerged = async (cfg) => {
 // poll mode
 // ---------------------------------------------------------------------------
 
+/**
+ * The scope rule is not "bugs". A bug qualifies because it arrives
+ * self-describing - screenshot, page URL, what broke - so the report itself is
+ * the brief. A feature request is a wish until somebody writes the spec, and
+ * the place they write it is the developer note, which the brief already
+ * labels as trusted team input distinct from the untrusted reporter text.
+ *
+ * So: work on anything self-describing, or anything a human has briefed.
+ *
+ * The note this action writes back is not a brief, and must not make a request
+ * re-qualify on a later run. The branch check in `alreadyHandled` is the real
+ * idempotency guard; this only stops a request the agent has already touched
+ * from looking human-briefed to a reader of the code.
+ */
+const AGENT_AUTHORED_NOTE_PREFIXES = ["Pull request: ", QUESTIONS_MARKER];
+
+const isWorkable = (feature) => {
+  if (feature.category === "ERROR") return true;
+  const note = (feature.developerNote ?? "").trim();
+  if (!note) return false;
+  return !AGENT_AUTHORED_NOTE_PREFIXES.some((prefix) => note.startsWith(prefix));
+};
+
 const alreadyHandled = (branch) => {
   const remote = shQuiet(`git ls-remote --heads origin ${branch}`);
   if (remote.ok && remote.out) return true;
@@ -172,7 +195,9 @@ const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFaile
       ? "The agent could not complete this one. Opening as a draft so nothing is lost."
       : questions
         ? "The agent stopped before writing code because the report is missing detail."
-        : "Opened automatically from a Reqio bug report.",
+        : feature.category === "ERROR"
+          ? "Opened automatically from a Reqio bug report."
+          : "Opened automatically from a Reqio request the team wrote a brief for.",
     "",
     `**Report:** ${feature.title}`,
     feature.pageUrl ? `**Page:** ${feature.pageUrl}` : "",
@@ -192,10 +217,15 @@ const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFaile
       "",
     );
   }
+  // The second sentence must follow the test section that is actually present.
+  // Pointing at "the test result above" when no test-command is configured
+  // sends the reviewer looking for a check that was never run.
   parts.push(
     "> Your own CI does not run on this pull request: GitHub suppresses workflow triggers for",
-    "> commits made with the default token. The test result above is the check, unless you have",
-    "> swapped in a PAT or GitHub App.",
+    "> commits made with the default token, unless you have swapped in a PAT or GitHub App.",
+    testResult
+      ? "> The test result above is the check."
+      : "> No test-command is configured, so nothing here has been verified by a machine.",
   );
   return parts.filter((p) => p !== "").join("\n");
 };
@@ -208,7 +238,10 @@ const handleOne = async (cfg, summary, opts) => {
   }
 
   const feature = await getFeature(cfg, summary.id);
-  if (feature.category !== "ERROR") return false;
+  if (!isWorkable(feature)) {
+    console.log(`[reqio] ${summary.id} is neither a bug nor briefed, skipping.`);
+    return false;
+  }
 
   // Auto mode picks up work nobody has moved yet, so the agent moves it itself.
   // That is what tells the reporter work has started, and it must happen before
@@ -320,10 +353,10 @@ const runPoll = async (cfg) => {
   // fail on an empty run, not after branching and opening a pull request.
   resolveAgentCommand();
 
-  const approved = await listFeatures(cfg, { status: "IN_PROGRESS", category: "ERROR" });
-  const pending = opts.autoApprove
-    ? await listFeatures(cfg, { status: "NEEDS_ACTION", category: "ERROR" })
-    : [];
+  // No category filter here: `isWorkable` decides per request, and it needs the
+  // developer note, which only the detail endpoint returns.
+  const approved = await listFeatures(cfg, { status: "IN_PROGRESS" });
+  const pending = opts.autoApprove ? await listFeatures(cfg, { status: "NEEDS_ACTION" }) : [];
   const candidates = [...approved, ...pending];
 
   if (candidates.length === 0) {
