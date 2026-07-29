@@ -1,5 +1,5 @@
 name: "Reqio feedback to pull request"
-description: "Turns approved Reqio bug reports into pull requests, and tells the reporter when you merge."
+description: "Turns approved Reqio reports into pull requests, and tells the reporter when you merge."
 author: "Reqio"
 
 branding:
@@ -25,7 +25,7 @@ inputs:
 
   # poll mode
   auto-approve:
-    description: "false: only bugs the team moved to In progress. true: also picks up new bugs, and the pull request becomes the only approval."
+    description: "false: only requests the team moved to In progress. true: also picks up new ones, and the pull request becomes the only approval."
     required: false
     default: "false"
   max-prs-per-run:
