@@ -307,6 +307,16 @@ const handleOne = async (cfg, summary, opts) => {
     getConversationThread(cfg, summary.id),
   ]);
 
+  /**
+   * Whether the attempt this run is about to replace already had code in it.
+   * `checkout -B` resets the branch to base, so it has to be read while the
+   * old tip is still reachable.
+   */
+  const priorAttempt = shQuiet(
+    `git diff --name-only ${opts.baseBranch}...refs/remotes/origin/${branch} -- . ":(exclude)${WORK_DIR}"`,
+  );
+  const priorAttemptHasCode = priorAttempt.ok && priorAttempt.out.trim() !== "";
+
   sh(`git checkout -B ${branch} ${opts.baseBranch}`);
   prepareWorkDir(feature, screenshot);
 
@@ -327,6 +337,22 @@ const handleOne = async (cfg, summary, opts) => {
   }
 
   const changed = hasCodeChanges();
+
+  /**
+   * Never force-push an empty attempt over one that had real code. The push is
+   * unconditional otherwise, so a single transient model outage was enough to
+   * replace a finished diff with a log file, and the work was gone with no
+   * trace in the pull request that it had ever existed. Leaving the previous
+   * attempt alone costs nothing: the request stays unclaimed and the next run
+   * tries again from the same place.
+   */
+  if (!changed && priorAttemptHasCode) {
+    console.log(
+      `[reqio] ${feature.id}: this attempt produced nothing and the open one has code. Leaving it alone.`,
+    );
+    return false;
+  }
+
   /**
    * A non-zero exit is not proof the agent failed. Gemini's CLI in particular
    * exits non-zero on teardown after writing a perfectly good diff, and gating
