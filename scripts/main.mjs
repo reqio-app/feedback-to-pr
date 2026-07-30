@@ -223,10 +223,10 @@ const restoreTestFiles = () => {
   return testFiles;
 };
 
-const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFailed }) => {
+const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFailed, changed }) => {
   const link = `${baseUrl}/dashboard/projects/${projectId}?feature=${feature.id}`;
   const parts = [
-    agentFailed
+    agentFailed && !changed
       ? "The agent could not complete this one. Opening as a draft so nothing is lost."
       : questions
         ? "The agent stopped before writing code because the report is missing detail."
@@ -239,6 +239,14 @@ const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFaile
     `**Reqio thread:** ${link}`,
     "",
   ];
+  if (agentFailed && changed) {
+    parts.push(
+      "> The agent exited with an error after writing this diff. The work is here and",
+      "> looks finished, but nothing proves it is. The log is committed under",
+      "> `.reqio-agent/` so you can see where it stopped. Read this one closely.",
+      "",
+    );
+  }
   if (questions) parts.push("### Open questions", "", questions, "");
   if (testResult) {
     parts.push(
@@ -319,7 +327,16 @@ const handleOne = async (cfg, summary, opts) => {
   }
 
   const changed = hasCodeChanges();
-  const draft = Boolean(questions) || !agentRun.ok || !changed;
+  /**
+   * A non-zero exit is not proof the agent failed. Gemini's CLI in particular
+   * exits non-zero on teardown after writing a perfectly good diff, and gating
+   * on that left every one of its pull requests a draft titled "wip:" saying
+   * the agent could not finish. Worse, an open draft does not count as a claim,
+   * so the next run picked the same request up and did it all again, forever.
+   * The diff is the signal that work happened; the exit code only colours how
+   * loudly the body warns about it.
+   */
+  const draft = Boolean(questions) || !changed;
 
   // Same credential scrub as the agent spawn: this command executes code the
   // agent just wrote, so it is no more trusted than the agent itself.
@@ -328,7 +345,13 @@ const handleOne = async (cfg, summary, opts) => {
 
   // A draft with no diff still needs a commit for the branch to exist.
   rmSync(path.join(WORK_DIR, "report.json"), { force: true });
-  if (!changed) {
+  if (!changed || !agentRun.ok) {
+    // Keep the log whenever the agent errored, even when it also produced code.
+    // That is precisely when a reviewer needs to see what it was doing when it
+    // died, and deleting it left them a warning with no evidence behind it.
+    // Rebuilt from scratch so the report screenshot stays out of the diff.
+    rmSync(WORK_DIR, { recursive: true, force: true });
+    mkdirSync(WORK_DIR, { recursive: true });
     writeFileSync(
       path.join(WORK_DIR, "agent-log.md"),
       `# Agent log\n\n${questions ? `## Questions\n\n${questions}\n\n` : ""}## Output\n\n\`\`\`\n${agentRun.log.slice(-6000)}\n\`\`\`\n`,
@@ -351,6 +374,7 @@ const handleOne = async (cfg, summary, opts) => {
     questions,
     testResult,
     agentFailed: !agentRun.ok,
+    changed,
   });
   const bodyFile = path.join(process.env.RUNNER_TEMP || ".", `reqio-pr-${feature.id}.md`);
   writeFileSync(bodyFile, body);
