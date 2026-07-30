@@ -304,7 +304,11 @@ const restoreTestFiles = () => {
 };
 
 const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFailed, changed }) => {
-  const link = `${baseUrl}/dashboard/projects/${projectId}?feature=${feature.id}`;
+  // A real route, not a query parameter. `?feature=` renders the board with
+  // nothing open, so every pull request the agent has opened so far carried a
+  // link that silently went nowhere, and this is the reviewer's only path back
+  // to the report it came from.
+  const link = `${baseUrl}/dashboard/projects/${projectId}/features/${feature.id}`;
   const parts = [
     agentFailed && !changed
       ? "The agent could not complete this one. Opening as a draft so nothing is lost."
@@ -400,7 +404,17 @@ const handleOne = async (cfg, summary, opts) => {
   const priorAttempt = shQuiet(
     `git diff --name-only ${opts.baseBranch}...refs/remotes/origin/${branch} -- . ":(exclude)${WORK_DIR}"`,
   );
-  const priorAttemptHasCode = priorAttempt.ok && priorAttempt.out.trim() !== "";
+  /**
+   * A FAILED check means "unknown", not "no code". The three-dot diff needs a
+   * merge base, and the workflow Reqio generates checks out shallow, so on a
+   * branch whose fork point was never fetched this errors rather than
+   * answering. Reading that as "nothing to protect" reinstated the exact
+   * clobbering this guard exists to prevent, on the default setup.
+   *
+   * So the guard fails safe: an attempt that produced nothing never overwrites
+   * a branch we could not read.
+   */
+  const priorAttemptHasCode = priorAttempt.ok ? priorAttempt.out.trim() !== "" : true;
 
   sh(`git checkout -B ${branch} ${opts.baseBranch}`);
   prepareWorkDir(feature, screenshot);
