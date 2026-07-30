@@ -103,8 +103,17 @@ export const getConversationThread = async (cfg, featureId) => {
   }
 };
 
-export const setDeveloperNote = (cfg, featureId, developerNote) =>
-  request(cfg, "PATCH", `/features/${featureId}/developer-note`, { developerNote });
+/**
+ * Replaces this action's zone of the developer note, leaving the human's brief
+ * above the marker untouched. The server does the splice inside a row lock, so
+ * a teammate editing the note at the same moment cannot lose either side.
+ *
+ * Deliberately not the whole-note PATCH: that endpoint still exists for humans
+ * deliberately rewriting everything, and using it here destroyed the spec the
+ * agent had just been handed.
+ */
+export const setDeveloperNoteAgentSection = (cfg, featureId, text) =>
+  request(cfg, "PUT", `/features/${featureId}/developer-note/agent-section`, { text });
 
 export const setStatus = (cfg, featureId, status, completionKind) =>
   request(cfg, "PATCH", `/features/${featureId}`, {

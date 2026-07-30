@@ -8,7 +8,7 @@ import {
   getFeature,
   getScreenshot,
   getConversationThread,
-  setDeveloperNote,
+  setDeveloperNoteAgentSection,
   setStatus,
   emitAgentEvent,
 } from "./reqio.mjs";
@@ -24,11 +24,35 @@ const WORK_DIR = ".reqio-agent";
 const QUESTIONS_FILE = path.join(WORK_DIR, "questions.md");
 
 /**
- * The heading the dashboard looks for to offer "Ask the reporter". It must stay
- * byte-identical to `copy.agent.questions.marker` in the Reqio web app; if they
- * drift, the affordance silently stops appearing.
+ * The developer note has two zones: whatever a human wrote, then everything
+ * this action wrote, split by AGENT_SECTION_MARKER at the start of a line.
+ * The action owns its zone completely and replaces it on every run; it must
+ * never touch the human's, which is the spec it was handed.
+ *
+ * Both markers are byte-identical to `copy.agent.agentSection.marker` and
+ * `copy.agent.questions.marker` in the Reqio web app. If they drift, the
+ * dashboard stops recognising the zone and the "Ask the reporter" affordance
+ * silently disappears.
+ *
+ * The pull request line is written ABOVE the questions heading on purpose.
+ * Questions run to the end of the note, so anything placed after them gets
+ * parsed as a question and, via the one-click relay, sent to the end user.
+ * That leaked an internal repository URL to a stranger.
  */
-const QUESTIONS_MARKER = "## Questions for the reporter";
+const AGENT_SECTION_MARKER = "## Reqio agent";
+const QUESTIONS_MARKER = "### Questions for the reporter";
+
+/** Splits a raw note into what the human wrote and what this action wrote. */
+const splitAgentSection = (note) => {
+  const text = note ?? "";
+  const lines = text.split("\n");
+  const index = lines.findIndex((line) => line.trim() === AGENT_SECTION_MARKER);
+  if (index === -1) return { human: text, agent: null };
+  return {
+    human: lines.slice(0, index).join("\n"),
+    agent: lines.slice(index + 1).join("\n"),
+  };
+};
 
 const sh = (cmd, opts = {}) => execSync(cmd, { encoding: "utf8", stdio: "pipe", ...opts }).trim();
 const shQuiet = (cmd, opts = {}) => {
@@ -104,18 +128,43 @@ const runMerged = async (cfg) => {
  *
  * So: work on anything self-describing, or anything a human has briefed.
  *
- * The note this action writes back is not a brief, and must not make a request
- * re-qualify on a later run. The branch check in `alreadyHandled` is the real
- * idempotency guard; this only stops a request the agent has already touched
- * from looking human-briefed to a reader of the code.
+ * This reads the HUMAN zone only. Previously the writeback replaced the whole
+ * note, and this tested that the note did not START with agent-authored text.
+ * The two combined into a trap: once the agent wrote back, a briefed request
+ * looked un-briefed forever, so its draft could never be resumed and the spec
+ * a human wrote was already gone. Splitting the zones is what lets this ask
+ * the only question it ever meant to ask: did a human write a spec?
  */
-const AGENT_AUTHORED_NOTE_PREFIXES = ["Pull request: ", QUESTIONS_MARKER];
-
 const isWorkable = (feature) => {
   if (feature.category === "ERROR") return true;
-  const note = (feature.developerNote ?? "").trim();
-  if (!note) return false;
-  return !AGENT_AUTHORED_NOTE_PREFIXES.some((prefix) => note.startsWith(prefix));
+  return splitAgentSection(feature.developerNote).human.trim().length > 0;
+};
+
+/**
+ * An open draft is retryable, which is what lets a half-finished attempt be
+ * picked back up. But a draft that stopped to ASK something is not waiting on
+ * a retry, it is waiting on a person, and retrying it changes nothing: the
+ * agent re-reads the same unanswered thread and asks again.
+ *
+ * Left alone that ran the model, force-pushed the branch and re-fired the
+ * "needs context" notification on every poll, forever, at the customer's
+ * expense. So: hold while questions are outstanding, and release the moment
+ * anyone says anything the agent has not seen. A human editing the brief to
+ * answer inline also releases it, because that moves developerNoteUpdatedAt.
+ */
+const isWaitingOnReporter = (feature, thread) => {
+  const { agent } = splitAgentSection(feature.developerNote);
+  if (agent === null || !agent.includes(QUESTIONS_MARKER)) return false;
+
+  const askedAt = Date.parse(feature.developerNoteUpdatedAt ?? "");
+  // Without a timestamp there is no way to tell answered from unanswered.
+  // Retrying forever is the worse failure, so hold and let a human resolve it.
+  if (Number.isNaN(askedAt)) return true;
+
+  return !(thread?.messages ?? []).some((message) => {
+    const at = Date.parse(message.createdAt ?? "");
+    return !Number.isNaN(at) && at > askedAt;
+  });
 };
 
 /** The pull request on this branch, in any state, or null if there is none. */
@@ -338,6 +387,11 @@ const handleOne = async (cfg, summary, opts) => {
     getConversationThread(cfg, summary.id),
   ]);
 
+  if (isWaitingOnReporter(feature, thread)) {
+    console.log(`[reqio] ${summary.id} is waiting on an answer to the agent's questions, skipping.`);
+    return false;
+  }
+
   /**
    * Whether the attempt this run is about to replace already had code in it.
    * `checkout -B` resets the branch to base, so it has to be read while the
@@ -475,10 +529,15 @@ const handleOne = async (cfg, summary, opts) => {
     prUrl = created.out.split("\n").filter(Boolean).pop();
   }
 
-  const note = questions
-    ? `${QUESTIONS_MARKER}\n${questions}\n\nDraft pull request: ${prUrl}`
-    : `Pull request: ${prUrl}`;
-  await setDeveloperNote(cfg, feature.id, note);
+  // Writes ONLY this action's zone. The human's brief above the marker is
+  // preserved by the server, which splices inside a row lock. The previous
+  // whole-note PATCH destroyed the spec a human had written the moment a pull
+  // request opened, which is also what made briefed requests unresumable.
+  const agentSection = [
+    `${questions ? "Draft pull" : "Pull"} request: ${prUrl}`,
+    ...(questions ? ["", QUESTIONS_MARKER, questions] : []),
+  ].join("\n");
+  await setDeveloperNoteAgentSection(cfg, feature.id, agentSection);
 
   await emitAgentEvent(
     cfg,
