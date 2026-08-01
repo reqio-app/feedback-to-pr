@@ -1,0 +1,81 @@
+name: Reqio agent (review)
+
+# Three places a human can leave feedback on a pull request, three different
+# GitHub events. Subscribing to fewer than all three means the agent silently
+# ignores feedback depending on which box the reviewer happened to type into.
+#
+#   Conversation tab, bottom box   -> issue_comment
+#   Files changed, single comment  -> pull_request_review_comment
+#   Files changed, Submit review   -> pull_request_review
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Submitting a review with five inline comments emits pull_request_review AND
+# five pull_request_review_comment events. Every one of them would start a run
+# against the same branch, so five agents would race a push at each other.
+# Cancelling in progress collapses the burst: each run re-reads every comment
+# since the last push, so the survivor sees the whole review and losing an
+# earlier one costs nothing.
+concurrency:
+  group: reqio-review-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  address-review:
+    # The issue_comment payload has no branch on it, so this cannot filter on
+    # the reqio/feature- prefix here - the action does that on its first line
+    # instead. Everything that CAN be decided from the payload is decided here,
+    # because a job that starts only to exit still bills a whole minute.
+    #
+    # author_association is not optional. On a public repository anyone can
+    # comment, and without this gate a stranger's comment spends the repo
+    # owner's model key inside the repo owner's runner.
+    #
+    # A review whose state is changes_requested needs no keyword: the state is
+    # already the request. A loose comment does, or "thanks, merging" starts an
+    # agent run and the bot talks over the humans on every thread.
+    if: >
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        github.event.comment.user.type != 'Bot' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        contains(github.event.comment.body, '/reqio')
+      ) || (
+        github.event_name == 'pull_request_review_comment' &&
+        github.event.pull_request.head.repo.fork == false &&
+        github.event.comment.user.type != 'Bot' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        contains(github.event.comment.body, '/reqio')
+      ) || (
+        github.event_name == 'pull_request_review' &&
+        github.event.pull_request.head.repo.fork == false &&
+        github.event.review.state == 'changes_requested' &&
+        github.event.review.user.type != 'Bot' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: reqio-app/feedback-to-pr@v1
+        with:
+          mode: review
+          pr-number: ${{ github.event.issue.number || github.event.pull_request.number }}
+          project-id: YOUR_PROJECT_ID
+          base-url: https://reqio.app
+          branch-prefix: "reqio/feature-"
+          test-command: ""
+          allow-test-edits: "false"
+        env:
+          REQIO_API_KEY: ${{ secrets.REQIO_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

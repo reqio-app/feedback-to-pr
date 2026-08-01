@@ -9,7 +9,11 @@ team moves it to In progress
         ↓
 this action opens a pull request
         ↓
-you review and merge
+you review  ──→  ask for changes, the agent revises it
+        ↓                        ↑
+        └────────────────────────┘
+        ↓
+you merge
         ↓
 the reporter gets an email saying it shipped
 ```
@@ -57,7 +61,29 @@ Both are used only inside your own runner. Reqio never sees the model key, and t
 | `allow-test-edits` | `false` | Keeps the agent out of your test files. |
 | `agent-command` | Claude Code | Any CLI that reads a brief on stdin and edits the checkout in place. |
 | `base-branch` | repo default | Branch to cut from. |
+| `pr-number` | empty | Review mode only. The pull request that was reviewed. |
 | `completion-kind` | `NEXT_UPDATE` | Merge mode only. `SHIPPED` if merging deploys for you. |
+
+## Asking the agent for changes
+
+The third workflow, [`reqio-agent-review.yml`](./examples/reqio-agent-review.yml), is optional. Without it a pull request is take-it-or-leave-it: if the agent gets it 80% right you finish the last 20% by hand and it never hears about the correction.
+
+With it, you review the way you would review a colleague:
+
+- Leave a comment containing **`/reqio`** anywhere on the pull request, on the conversation tab or on a specific line.
+- Or submit a review with **Request changes**, which needs no keyword because the state already is the request.
+
+The agent checks out the pull request head, reads every comment left since its last push, and pushes a commit on top. It does not start over: the diff you reviewed is in its brief, and it is told to amend that, not to re-solve the problem. Then it replies on the pull request saying what it did.
+
+If a comment is ambiguous enough that it would be guessing, it makes no change and posts its questions instead. Those stay on the pull request. They are never relayed to the person who reported the bug, who did not ask to be consulted about your code.
+
+Three things worth knowing:
+
+**Only collaborators can trigger it.** The workflow checks `author_association` and so does the action. On a public repo, without that, a stranger's comment would spend your model key in your runner.
+
+**Comments are fenced like reporter text.** A reviewer has push access, so their words are far more trusted than a bug report, but the fence stays. On a public repository one YAML condition is the only thing separating a stranger from a prompt with repo write access, and protection that thin should not be the only layer.
+
+**It pushes, it never force-pushes.** Poll mode rebuilds the branch from base and force-pushes; this mode adds a commit to the exact head you read. If someone pushed while the agent was working, the push loses, and it tells you rather than overwriting the work.
 
 ## Two things worth knowing before you turn this on
 
