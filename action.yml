@@ -8,7 +8,7 @@ branding:
 
 inputs:
   mode:
-    description: "poll (find approved bugs and open pull requests) or merged (close the loop after a merge)."
+    description: "poll (find approved bugs and open pull requests), review (act on review feedback left on one of its pull requests), or merged (close the loop after a merge)."
     required: false
     default: "poll"
   project-id:
@@ -46,6 +46,12 @@ inputs:
     default: "npx -y @anthropic-ai/claude-code@latest -p --permission-mode bypassPermissions"
   base-branch:
     description: "Branch to cut from. Defaults to the repository default branch."
+    required: false
+    default: ""
+
+  # review mode
+  pr-number:
+    description: "Pull request that was reviewed. The branch, and from it the feature id, is looked up from this."
     required: false
     default: ""
 
@@ -87,6 +93,7 @@ runs:
         REQIO_ALLOW_TEST_EDITS: ${{ inputs.allow-test-edits }}
         REQIO_AGENT_COMMAND: ${{ inputs.agent-command }}
         REQIO_BASE_BRANCH: ${{ inputs.base-branch }}
+        REQIO_PR_NUMBER: ${{ inputs.pr-number }}
         REQIO_BRANCH: ${{ inputs.branch }}
         REQIO_COMPLETION_KIND: ${{ inputs.completion-kind }}
         GH_TOKEN: ${{ inputs.github-token }}

@@ -12,7 +12,7 @@ import {
   setStatus,
   emitAgentEvent,
 } from "./reqio.mjs";
-import { buildBrief } from "./prompt.mjs";
+import { buildBrief, buildReviewBrief } from "./prompt.mjs";
 
 // bypassPermissions is not optional in CI: -p alone still enforces permission
 // checks, and a prompt the agent cannot display is a refusal to edit anything.
@@ -617,9 +617,274 @@ const runPoll = async (cfg) => {
   setOutput("handled", String(handled));
 };
 
+// ---------------------------------------------------------------------------
+// review mode: a human asked for changes on the agent's pull request
+// ---------------------------------------------------------------------------
+
+/**
+ * Only people with push access get to drive the agent.
+ *
+ * On a public repository anyone can comment on a pull request, and every
+ * triggered run spends the repository owner's model key inside their runner.
+ * The workflow's `if:` gates on this as well, and that copy is the one that
+ * saves the billed minute; this copy is the one that cannot be edited away by
+ * someone loosening a YAML condition later.
+ */
+const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+const ghJson = (args) => {
+  const res = run("gh", args);
+  if (!res.ok) return null;
+  try {
+    return JSON.parse(res.out);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Everything said after the branch last moved is unaddressed; everything said
+ * before it has already been answered with code. Reading the watermark off the
+ * branch tip means no state is stored anywhere, and it stays right when a human
+ * pushes a fixup of their own.
+ */
+const lastPushAt = () => {
+  const res = shQuiet("git log -1 --format=%cI HEAD");
+  const at = res.ok ? Date.parse(res.out) : NaN;
+  return Number.isNaN(at) ? 0 : at;
+};
+
+/**
+ * Everything a trusted human has said on this pull request since the last push,
+ * from all three places GitHub lets them say it: the conversation tab
+ * (issue comments), inline comments on the diff, and the body of a submitted
+ * review.
+ *
+ * The trigger keyword is deliberately NOT filtered here. It decides whether a
+ * run starts; once one has, the agent should see all the feedback, including
+ * the comments that did not think to address it by name.
+ */
+const gatherFeedback = (repo, number, since) => {
+  const issue = (ghJson(["api", `repos/${repo}/issues/${number}/comments`, "--paginate"]) ?? []).map((c) => ({
+    body: c.body,
+    author: c.user?.login,
+    userType: c.user?.type,
+    association: c.author_association,
+    createdAt: c.created_at,
+    path: null,
+    line: null,
+    diffHunk: null,
+  }));
+  const inline = (ghJson(["api", `repos/${repo}/pulls/${number}/comments`, "--paginate"]) ?? []).map((c) => ({
+    body: c.body,
+    author: c.user?.login,
+    userType: c.user?.type,
+    association: c.author_association,
+    createdAt: c.created_at,
+    path: c.path,
+    line: c.line ?? c.original_line,
+    diffHunk: c.diff_hunk,
+  }));
+  const reviews = (ghJson(["api", `repos/${repo}/pulls/${number}/reviews`, "--paginate"]) ?? []).map((r) => ({
+    body: r.body,
+    author: r.user?.login,
+    userType: r.user?.type,
+    association: r.author_association,
+    createdAt: r.submitted_at,
+    path: null,
+    line: null,
+    diffHunk: null,
+  }));
+
+  return [...issue, ...inline, ...reviews]
+    .filter((row) => (row.body ?? "").trim())
+    // Its own comments are not feedback. Without this the agent answers itself.
+    .filter((row) => row.userType !== "Bot")
+    .filter((row) => TRUSTED_ASSOCIATIONS.has(row.association))
+    .filter((row) => {
+      const at = Date.parse(row.createdAt ?? "");
+      return !Number.isNaN(at) && at > since;
+    })
+    .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+};
+
+const reviewComment = ({ questions, testResult, agentFailed, changed }) => {
+  const parts = [
+    changed
+      ? "Pushed a commit addressing the review feedback above."
+      : questions
+        ? "I stopped without changing anything, because answering this would have meant guessing."
+        : "I ran against this feedback and it did not produce a change. Nothing has been pushed.",
+  ];
+  if (agentFailed && changed) {
+    parts.push(
+      "",
+      "> The agent exited with an error after writing this diff. The work looks",
+      "> finished but nothing proves it is. Read this one closely.",
+    );
+  }
+  if (questions) parts.push("", "### Open questions", "", questions);
+  if (testResult) {
+    parts.push(
+      "",
+      "### Tests",
+      "",
+      testResult.ok ? "Passed inside the agent job." : "FAILED inside the agent job.",
+      "",
+      "```",
+      testResult.out.slice(-3000),
+      "```",
+    );
+  }
+  return parts.join("\n");
+};
+
+const postReviewComment = (number, body) => {
+  const file = path.join(process.env.RUNNER_TEMP || ".", `reqio-review-${number}.md`);
+  writeFileSync(file, body);
+  const posted = run("gh", ["pr", "comment", String(number), "--body-file", file]);
+  if (!posted.ok) console.error(`[reqio] could not comment on #${number}: ${posted.out}`);
+};
+
+const runReview = async (cfg) => {
+  const number = (process.env.REQIO_PR_NUMBER || "").trim();
+  // Digits only. It reaches gh and git as argv either way, but a pull request
+  // number that is not a number means the workflow is wired wrong, and failing
+  // here is clearer than a confusing gh error three calls later.
+  if (!/^\d+$/.test(number)) {
+    throw new Error("pr-number must be the number of the pull request being reviewed.");
+  }
+  const prefix = process.env.REQIO_BRANCH_PREFIX || "reqio/feature-";
+  const repo = process.env.GITHUB_REPOSITORY || "";
+  const opts = {
+    testCommand: (process.env.REQIO_TEST_COMMAND || "").trim(),
+    allowTestEdits: bool(process.env.REQIO_ALLOW_TEST_EDITS),
+  };
+  resolveAgentCommand();
+
+  const pr = ghJson(["pr", "view", number, "--json", "headRefName,url,state,isDraft,number"]);
+
+  /**
+   * The issue_comment payload carries no branch, only an issue number, so the
+   * workflow cannot filter on the branch prefix in its `if:`. This line is the
+   * first moment the job can tell whether the comment was even on an agent
+   * pull request, which means every unrelated comment in the repository gets
+   * this far. Keep everything above it cheap.
+   */
+  if (!pr || pr.state !== "OPEN" || !pr.headRefName?.startsWith(prefix)) {
+    console.log(`[reqio] #${number} is not an open agent pull request, nothing to do.`);
+    setOutput("handled", "0");
+    return;
+  }
+  const featureId = pr.headRefName.slice(prefix.length);
+
+  const checkout = run("gh", ["pr", "checkout", number, "--force"]);
+  if (!checkout.ok) {
+    console.error(`[reqio] could not check out #${number}: ${checkout.out}`);
+    setOutput("handled", "0");
+    return;
+  }
+
+  const feedback = gatherFeedback(repo, number, lastPushAt());
+  if (!feedback.length) {
+    console.log(`[reqio] #${number} has nothing new from a collaborator since the last push.`);
+    setOutput("handled", "0");
+    return;
+  }
+
+  sh(`git config user.name "reqio-agent[bot]"`);
+  sh(`git config user.email "agent@reqio.app"`);
+
+  const feature = await getFeature(cfg, featureId);
+  const diff = run("gh", ["pr", "diff", number]);
+
+  rmSync(WORK_DIR, { recursive: true, force: true });
+  mkdirSync(WORK_DIR, { recursive: true });
+
+  const agentRun = runAgent(
+    buildReviewBrief({
+      feature,
+      diff: diff.ok ? diff.out : "",
+      comments: feedback,
+      allowTestEdits: opts.allowTestEdits,
+      testCommand: opts.testCommand,
+    }),
+  );
+  const questions = readQuestions();
+
+  if (!opts.allowTestEdits) {
+    const reverted = restoreTestFiles();
+    if (reverted.length) console.log(`[reqio] reverted agent edits to ${reverted.length} test file(s).`);
+  }
+
+  const changed = hasCodeChanges();
+  rmSync(WORK_DIR, { recursive: true, force: true });
+
+  if (!changed) {
+    // Say so on the pull request rather than silently. A reviewer who asked for
+    // a change and hears nothing back assumes the run is still going.
+    postReviewComment(number, reviewComment({ questions, testResult: null, agentFailed: !agentRun.ok, changed }));
+    console.log(`[reqio] #${number}: no change produced.`);
+    setOutput("handled", "0");
+    return;
+  }
+
+  let testResult = null;
+  if (opts.testCommand) testResult = shQuiet(opts.testCommand, { env: agentEnv() });
+
+  sh("git add -A");
+  execFileSync("git", ["commit", "-m", "fix: address review feedback", "-m", `Reqio request ${featureId}`], {
+    stdio: "pipe",
+  });
+
+  /**
+   * A plain push, never --force. Poll mode force-pushes because it rebuilds the
+   * branch from base; this mode adds a commit on top of the exact head the
+   * reviewer read. If someone pushed in between, losing the race is the correct
+   * outcome and the reviewer is told rather than quietly overwritten.
+   */
+  const pushed = run("git", ["push", "origin", `HEAD:${pr.headRefName}`]);
+  if (!pushed.ok) {
+    console.error(`[reqio] could not push to ${pr.headRefName}: ${pushed.out}`);
+    postReviewComment(
+      number,
+      "I wrote a change for the feedback above but could not push it: the branch moved while I was working. Comment again and I will redo it against the new head.",
+    );
+    setOutput("handled", "0");
+    return;
+  }
+
+  postReviewComment(number, reviewComment({ questions, testResult, agentFailed: !agentRun.ok, changed }));
+
+  // Code and no open questions means it has stopped being a work in progress.
+  if (pr.isDraft && !questions) {
+    const ready = run("gh", ["pr", "ready", number]);
+    if (!ready.ok) console.error(`[reqio] could not mark ${pr.url} ready: ${ready.out}`);
+  }
+
+  /**
+   * Rewrites this action's note zone so the request in Reqio still points at the
+   * pull request. Review questions are deliberately NOT written under
+   * QUESTIONS_MARKER: everything under that heading is offered to the team as
+   * one-click relay TO THE REPORTER, and a question about the shape of a code
+   * change is for the colleague who is reviewing it, not for the stranger who
+   * reported the bug. They go on the pull request and stay there.
+   */
+  await setDeveloperNoteAgentSection(
+    cfg,
+    featureId,
+    `Pull request: ${pr.url}\nLast updated from review feedback on the pull request.`,
+  );
+
+  console.log(`[reqio] #${number} updated from ${feedback.length} review comment(s).`);
+  setOutput("handled", "1");
+};
+
 const main = async () => {
   const cfg = config();
-  if ((process.env.REQIO_MODE || "poll") === "merged") return runMerged(cfg);
+  const mode = process.env.REQIO_MODE || "poll";
+  if (mode === "merged") return runMerged(cfg);
+  if (mode === "review") return runReview(cfg);
   return runPoll(cfg);
 };
 
