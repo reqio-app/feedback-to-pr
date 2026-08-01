@@ -274,7 +274,20 @@ const runAgent = (brief) => {
     });
     return { ok: true, log: out };
   } catch (error) {
-    return { ok: false, log: `${error.stdout ?? ""}\n${error.stderr ?? ""}`.trim() || String(error) };
+    const log = `${error.stdout ?? ""}\n${error.stderr ?? ""}`.trim() || String(error);
+    /**
+     * The only place this used to go was a file inside the work directory,
+     * which is committed solely when a pull request opens. So the one failure
+     * that opens nothing - the agent dying before it writes a line of code -
+     * was also the one failure that left no trace anywhere a human looks. A
+     * bad model key or a CLI that changed its flags read, from the outside, as
+     * "no work waiting", for as many polls as it took someone to notice.
+     *
+     * Actions masks registered secrets in log output, so the model key the
+     * agent was handed cannot surface here even if the agent echoes it.
+     */
+    console.error(`[reqio] the coding agent exited non-zero. Last output:\n${log.slice(-2000)}`);
+    return { ok: false, log };
   }
 };
 
@@ -371,7 +384,9 @@ const handleOne = async (cfg, summary, opts) => {
   // Retrying an existing branch force-pushes over it, and --force-with-lease
   // needs a remote-tracking ref to lease against or it refuses on stale info.
   // Absent (a first attempt) is fine; the lease simply has nothing to compare.
-  shQuiet(`git fetch origin ${branch}:refs/remotes/origin/${branch} --force`);
+  // Whether this succeeded is also the only reliable answer to "has this
+  // request ever been attempted", which the clobber guard below depends on.
+  const fetchedPrior = shQuiet(`git fetch origin ${branch}:refs/remotes/origin/${branch} --force`);
 
   const feature = await getFeature(cfg, summary.id);
   if (!isWorkable(feature)) {
@@ -401,9 +416,11 @@ const handleOne = async (cfg, summary, opts) => {
    * `checkout -B` resets the branch to base, so it has to be read while the
    * old tip is still reachable.
    */
-  const priorAttempt = shQuiet(
-    `git diff --name-only ${opts.baseBranch}...refs/remotes/origin/${branch} -- . ":(exclude)${WORK_DIR}"`,
-  );
+  const priorAttempt = fetchedPrior.ok
+    ? shQuiet(
+        `git diff --name-only ${opts.baseBranch}...refs/remotes/origin/${branch} -- . ":(exclude)${WORK_DIR}"`,
+      )
+    : null;
   /**
    * A FAILED check means "unknown", not "no code". The three-dot diff needs a
    * merge base, and the workflow Reqio generates checks out shallow, so on a
@@ -413,8 +430,22 @@ const handleOne = async (cfg, summary, opts) => {
    *
    * So the guard fails safe: an attempt that produced nothing never overwrites
    * a branch we could not read.
+   *
+   * But "unknown" and "there is no branch" are different answers, and conflating
+   * them broke every FIRST attempt that produced no diff. The fetch above fails
+   * outright when the remote branch does not exist, the diff then fails for the
+   * same reason, and the fail-safe read that as work worth protecting. So a
+   * request whose agent errored got no draft pull request, no committed log and
+   * no questions - just a skip line claiming an open attempt that had never
+   * existed, repeated silently on every poll forever. Absence of the branch is
+   * positive knowledge that there is nothing to protect; only a branch we
+   * fetched but could not diff is genuinely unknown.
    */
-  const priorAttemptHasCode = priorAttempt.ok ? priorAttempt.out.trim() !== "" : true;
+  const priorAttemptHasCode = !fetchedPrior.ok
+    ? false
+    : priorAttempt.ok
+      ? priorAttempt.out.trim() !== ""
+      : true;
 
   sh(`git checkout -B ${branch} ${opts.baseBranch}`);
   prepareWorkDir(feature, screenshot);
@@ -447,7 +478,7 @@ const handleOne = async (cfg, summary, opts) => {
    */
   if (!changed && priorAttemptHasCode) {
     console.log(
-      `[reqio] ${feature.id}: this attempt produced nothing and the open one has code. Leaving it alone.`,
+      `[reqio] ${feature.id}: this attempt produced nothing and ${branch} already has code. Leaving it alone.`,
     );
     return false;
   }
