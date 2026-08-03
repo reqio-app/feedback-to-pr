@@ -257,25 +257,113 @@ const prepareWorkDir = (feature, screenshot) => {
 };
 
 /**
- * The agent is driven by text a stranger wrote, so it is spawned WITHOUT the
- * credentials this action holds. `execSync` inherits the whole environment by
- * default, which would hand a prompt-injected agent the repo token and the
- * Reqio key. Only the model key and the ordinary runner variables survive.
+ * The agent is driven by text a stranger wrote, and `test-command` then runs
+ * whatever the agent just wrote, so neither is spawned with the whole job's
+ * environment. `execSync` inherits everything by default, and a denylist of
+ * this action's own credentials (the previous approach here) only ever
+ * removes what THIS action recognises - GH_TOKEN, REQIO_API_KEY - and passes
+ * the rest through unexamined. On a real customer job "the rest" is not just
+ * an unused model key: it is whatever else that job's env block declares for
+ * its own reasons - a deploy token, a cloud credential, a registry token, a
+ * database URL - none of which this action can know about in advance, all of
+ * which a prompt-injected agent or an agent-authored test suite can read and
+ * exfiltrate with the job's unrestricted egress. So: allowlist, not denylist.
  *
- * Denylist rather than allowlist on purpose: `agent-command` is user-swappable,
- * so an unknown provider's key must still reach the agent it belongs to.
+ * Two lists, both intentionally curated rather than exhaustive:
+ *
+ * - RUNNER_PLUMBING is what any subprocess needs to run at all - locate its
+ *   interpreter, resolve a hostname, write a temp file. None of it is secret;
+ *   withholding it just makes the agent fail in confusing, unrelated ways.
+ * - MODEL_PROVIDER_VARS covers the providers a swapped-in `agent-command`
+ *   plausibly authenticates against. It cannot cover every provider that will
+ *   ever exist. `agent-command` is user-swappable, so when it targets a
+ *   provider not listed here, extend this list rather than the job's env -
+ *   see the README's "Safety" section.
+ *
+ * Deliberately NOT done: accepting a customer-supplied passthrough list as an
+ * input. That would only move the footgun from "the job's own env block" to
+ * "this action's config", and it would get filled in exactly the same way
+ * under the same time pressure. The actual fix is that a secret this job has
+ * no reason to hand the agent should not be declared on this job at all - an
+ * allowlist here is a second layer, not a substitute for that.
  */
-const SECRETS_WITHHELD_FROM_AGENT = [
-  "GH_TOKEN",
-  "GITHUB_TOKEN",
-  "REQIO_API_KEY",
-  "REQIO_PROJECT_ID",
-  "REQIO_BASE_URL",
+const RUNNER_PLUMBING = [
+  "PATH",
+  "HOME",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "USER",
+  "USERNAME",
+  "USERPROFILE",
+  "PWD",
+  "SystemRoot",
+  "windir",
+  "ComSpec",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "CI",
+  "GITHUB_ACTIONS",
+  "RUNNER_OS",
+  "RUNNER_ARCH",
+  "RUNNER_TEMP",
 ];
 
+/**
+ * Grouped by the CLI each var authenticates. GH_TOKEN, GITHUB_TOKEN,
+ * REQIO_API_KEY, REQIO_PROJECT_ID and REQIO_BASE_URL are deliberately absent -
+ * this action's own credentials never belong to the agent regardless of what
+ * gets added below.
+ */
+const MODEL_PROVIDER_VARS = [
+  // Claude Code - the default agent-command.
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_MODEL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  // OpenAI and OpenAI-compatible CLIs (Codex and others).
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "OPENAI_ORG_ID",
+  // Gemini CLI.
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_GENAI_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_PROJECT",
+  // Other providers a swapped-in agent-command plausibly targets.
+  "AZURE_OPENAI_API_KEY",
+  "AZURE_OPENAI_ENDPOINT",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_REGION",
+  "MISTRAL_API_KEY",
+  "COHERE_API_KEY",
+  "GROQ_API_KEY",
+  "XAI_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "OPENROUTER_API_KEY",
+  "TOGETHER_API_KEY",
+  "OLLAMA_HOST",
+];
+
+const AGENT_ENV_ALLOWLIST = new Set([...RUNNER_PLUMBING, ...MODEL_PROVIDER_VARS]);
+
 const agentEnv = () => {
-  const env = { ...process.env };
-  for (const key of SECRETS_WITHHELD_FROM_AGENT) delete env[key];
+  const env = {};
+  for (const key of Object.keys(process.env)) {
+    if (AGENT_ENV_ALLOWLIST.has(key)) env[key] = process.env[key];
+  }
   return env;
 };
 
@@ -353,6 +441,17 @@ const restoreTestFiles = () => {
   return testFiles;
 };
 
+/**
+ * Wraps reporter-supplied text as inline code so markdown inside it -
+ * asterisks, underscores, pipes, a stray heading - cannot distort the
+ * sections of the pull request body that follow it. `title` is regex-
+ * restricted to a single line server-side, so there is no line break to
+ * worry about, only a literal backtick, which would close the span early.
+ * Markdown has no backslash-escape for a backtick inside a single-backtick
+ * span, so it is replaced rather than escaped.
+ */
+const mdInlineCode = (text) => `\`${String(text).replace(/`/g, "'")}\``;
+
 const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFailed, changed }) => {
   // A real route, not a query parameter. `?feature=` renders the board with
   // nothing open, so every pull request the agent has opened so far carried a
@@ -368,7 +467,7 @@ const prBody = ({ feature, baseUrl, projectId, questions, testResult, agentFaile
           ? "Opened automatically from a Reqio bug report."
           : "Opened automatically from a Reqio request the team wrote a brief for.",
     "",
-    `**Report:** ${feature.title}`,
+    `**Report:** ${mdInlineCode(feature.title)}`,
     feature.pageUrl ? `**Page:** ${feature.pageUrl}` : "",
     `**Reqio thread:** ${link}`,
     "",
@@ -862,7 +961,10 @@ const runReview = async (cfg) => {
   };
   resolveAgentCommand();
 
-  const pr = ghJson(["pr", "view", number, "--json", "headRefName,url,state,isDraft,number"]);
+  const pr = ghJson([
+    "pr", "view", number,
+    "--json", "headRefName,url,state,isDraft,number,isCrossRepository,headRepositoryOwner",
+  ]);
 
   /**
    * The issue_comment payload carries no branch, only an issue number, so the
@@ -876,6 +978,36 @@ const runReview = async (cfg) => {
     setOutput("handled", "0");
     return;
   }
+
+  /**
+   * The load-bearing fork gate. `issue_comment` (the Conversation-tab
+   * trigger) carries no repository information on its payload at all, only
+   * an issue number, so GitHub's automatic fork-permission downgrade never
+   * applies to it and the workflow's `if:` cannot express a fork check for
+   * that event - there is no `github.event.pull_request.head.repo.fork` to
+   * read. `pull_request_review_comment` and `pull_request_review` do carry
+   * that field and the example workflow already checks it, but a workflow
+   * file is something a customer can loosen later, or simply not copy
+   * correctly. This check runs regardless of what the workflow's `if:` says,
+   * which is what makes it the actual protection rather than a second copy
+   * of the same one.
+   *
+   * Without it: fork a public repo, open a pull request from a branch
+   * matching `branch-prefix`, get any trusted collaborator to comment
+   * `/reqio` anywhere on it (or on the wrong thing entirely, by accident),
+   * and `gh pr checkout --force` below would pull the fork's code into a job
+   * holding `contents: write`, `pull-requests: write`, and every secret on
+   * it. Refuse loudly instead of skipping quietly: this is a security
+   * refusal, not a routine "nothing to do here".
+   */
+  if (pr.isCrossRepository) {
+    const forkOwner = pr.headRepositoryOwner?.login ?? "an unknown fork";
+    throw new Error(
+      `#${number} is a pull request from a fork (${forkOwner}), refusing to check it out or run the agent against it. ` +
+        "This action never acts on fork-originated pull requests, regardless of what triggered this run.",
+    );
+  }
+
   const featureId = pr.headRefName.slice(prefix.length);
 
   const checkout = run("gh", ["pr", "checkout", number, "--force"]);

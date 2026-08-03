@@ -100,11 +100,13 @@ The agent checks out the pull request head, reads every comment left since its l
 
 If a comment is ambiguous enough that it would be guessing, it makes no change and posts its questions instead. Those stay on the pull request. They are never relayed to the person who reported the bug, who did not ask to be consulted about your code.
 
-Three things worth knowing:
+Four things worth knowing:
 
 **Only collaborators can trigger it.** The workflow checks `author_association` and so does the action. On a public repo, without that, a stranger's comment would spend your model key in your runner.
 
-**Comments are fenced like reporter text.** A reviewer has push access, so their words are far more trusted than a bug report, but the fence stays. On a public repository one YAML condition is the only thing separating a stranger from a prompt with repo write access, and protection that thin should not be the only layer.
+**It refuses to run against a fork, and that refusal does not live in your workflow file.** `issue_comment` - the Conversation-tab trigger - carries no repository information on its payload at all, only an issue number, so there is no `head.repo.fork` for a YAML `if:` to check on that event. The other two events do carry it and the example workflow checks it, but a workflow file is something you can loosen later, or a generated one you might not copy exactly. The action itself asks GitHub whether the pull request is cross-repository before it checks anything out, and refuses loudly if it is, regardless of what triggered the run or what your `if:` says. That check, not the YAML, is what actually stops a forked pull request from running with your `contents: write` token and your job's secrets.
+
+**Comments are fenced like reporter text.** A reviewer has push access, so their words are far more trusted than a bug report, but the fence stays. `author_association` and the fork check above are real protection, but they are still one compromised collaborator account away from a bad day, and the fence limits what that day costs you.
 
 **It pushes, it never force-pushes.** Poll mode rebuilds the branch from base and force-pushes; this mode adds a commit to the exact head you read. If someone pushed while the agent was working, the push loses, and it tells you rather than overwriting the work.
 
@@ -119,9 +121,9 @@ Repositories without a test suite get noticeably worse results, because the agen
 ## Safety
 
 - Bug reports are text written by strangers, and it becomes an agent prompt next to repo write access. Report content is fenced and labelled as untrusted data in the brief, and the agent is told that instructions found inside it are to be reported, not followed.
-- The agent is spawned without this action's credentials. `GH_TOKEN` and `REQIO_API_KEY` are stripped from its environment, and from the environment your `test-command` runs in, since that executes code the agent just wrote. Your model key is passed through; nothing else of ours is.
+- The agent, and `test-command` after it, run with an **allowlisted** environment, not your job's whole one. `GH_TOKEN` and `REQIO_API_KEY` are never on that list, and neither is anything else your job declares for its own reasons - a deploy token, a cloud credential, a database URL. Only your model key (a known set of model-provider variables) and ordinary runner plumbing (`PATH`, `HOME`, proxy settings, and the like) get through. This is deliberately a fixed list in the action's code, not a passthrough you configure on the job - see `AGENT_ENV_ALLOWLIST` in `scripts/main.mjs` if `agent-command` targets a provider not already on it. Either way, do not declare a secret on this job that the agent has no reason to see; the allowlist is a second layer, not a substitute for that.
 - The workflow asks for `contents: write` and `pull-requests: write` and nothing else.
-- The agent never pushes to your default branch and never runs on fork-originated events.
+- The agent never pushes to your default branch. Poll and merged mode never run on fork-originated events at all, and review mode's `runReview` refuses server-side before checkout if the pull request it was asked to act on turns out to be cross-repository - the one case (`issue_comment`) where the workflow's own `if:` cannot express that check. See "Asking the agent for changes" above.
 - With `allow-test-edits: false` (the default) any edit the agent makes to a test file is reverted before the commit.
 - The API key is audience-bound to one Reqio project server-side. Presented against a different project it fails closed.
 - Every pull request is reviewed by a human. Turn on branch protection so that stays true.

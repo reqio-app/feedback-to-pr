@@ -48,19 +48,32 @@ jobs:
     # A review whose state is changes_requested needs no keyword: the state is
     # already the request. A loose comment does, or "thanks, merging" starts an
     # agent run and the bot talks over the humans on every thread.
+    #
+    # The keyword check is a plain contains('/reqio') no longer: that matched
+    # any comment merely MENTIONING the integration, not just ones invoking it -
+    # "see https://reqio.app" or "github.com/reqio-app/feedback-to-pr" both
+    # contain the substring "/reqio" without anyone typing the command. GitHub's
+    # expression language has no regex or split, so this pads the body with a
+    # leading/trailing space and requires '/reqio' to appear as its own
+    # space-delimited word. That misses '/reqio' written on its own line with no
+    # surrounding space, which is an accepted gap: this condition only decides
+    # whether the job starts at all (the billed-minute saving), never whether it
+    # is allowed to act - author_association above and runReview's fork gate in
+    # main.mjs are what actually gate that, and neither depends on this text
+    # matching precisely. See the README's "Asking the agent for changes".
     if: >
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
         github.event.comment.user.type != 'Bot' &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-        contains(github.event.comment.body, '/reqio')
+        contains(format(' {0} ', github.event.comment.body), ' /reqio ')
       ) || (
         github.event_name == 'pull_request_review_comment' &&
         github.event.pull_request.head.repo.fork == false &&
         github.event.comment.user.type != 'Bot' &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-        contains(github.event.comment.body, '/reqio')
+        contains(format(' {0} ', github.event.comment.body), ' /reqio ')
       ) || (
         github.event_name == 'pull_request_review' &&
         github.event.pull_request.head.repo.fork == false &&
