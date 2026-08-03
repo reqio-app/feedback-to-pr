@@ -999,8 +999,16 @@ const runReview = async (cfg) => {
    * holding `contents: write`, `pull-requests: write`, and every secret on
    * it. Refuse loudly instead of skipping quietly: this is a security
    * refusal, not a routine "nothing to do here".
+   *
+   * Tested against `!== false` rather than for truthiness so a missing field
+   * refuses instead of proceeding. `gh` errors on an unknown --json field, so
+   * today an unsupported field means `ghJson` returns null and the check above
+   * already caught it. That is a property of the current CLI, not a guarantee,
+   * and the cost of being wrong here is arbitrary code execution, so this
+   * reads the field as "proven same-repository" rather than "not known to be
+   * a fork".
    */
-  if (pr.isCrossRepository) {
+  if (pr.isCrossRepository !== false) {
     const forkOwner = pr.headRepositoryOwner?.login ?? "an unknown fork";
     throw new Error(
       `#${number} is a pull request from a fork (${forkOwner}), refusing to check it out or run the agent against it. ` +
