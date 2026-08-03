@@ -1,5 +1,10 @@
 name: Reqio agent (merged)
 
+# Unaffected by the @v2 quota claim - marking a request COMPLETED spends
+# nothing (ADR 0021 never meters status changes). See the README's
+# "Upgrading from v1" for what @v2 changes and why it is still safe to move
+# onto here.
+
 on:
   pull_request:
     types: [closed]
@@ -16,7 +21,7 @@ jobs:
     if: github.event.pull_request.merged == true && github.event.pull_request.head.repo.fork == false && startsWith(github.event.pull_request.head.ref, 'reqio/feature-')
     runs-on: ubuntu-latest
     steps:
-      - uses: reqio-app/feedback-to-pr@v1
+      - uses: reqio-app/feedback-to-pr@v2
         with:
           mode: merged
           project-id: YOUR_PROJECT_ID

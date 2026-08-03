@@ -1,25 +1,61 @@
 name: Reqio agent
 
+# @v2 adds the `verify` job below and a quota claim inside poll mode (see the
+# README's "Monthly quota"). @v1 workflows with no `mode` input at all keep
+# working exactly as before, unmetered - see "Upgrading from v1". New setups
+# should target @v2.
 on:
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "verify checks your setup without spending anything. poll does the real work."
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - poll
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: reqio-agent
-  cancel-in-progress: false
-
 jobs:
-  open-pull-requests:
+  # Run this first, from the Actions tab: it authenticates, lists candidates,
+  # reads one request and its screenshot, and checks this month's quota with a
+  # dry run. Never invokes your model, never opens a pull request, never
+  # spends a loop. See the README's "Run verify first".
+  verify:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'verify'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: reqio-app/feedback-to-pr@v2
+        with:
+          mode: verify
+          project-id: YOUR_PROJECT_ID
+          base-url: https://reqio.app
+        env:
+          REQIO_API_KEY: ${{ secrets.REQIO_API_KEY }}
 
-      - uses: reqio-app/feedback-to-pr@v1
+  open-pull-requests:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'poll')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: reqio-agent
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history. The action compares an in-flight attempt against the
+          # base branch to avoid overwriting work a previous run produced, and
+          # that comparison needs a merge base a shallow clone does not have.
+          fetch-depth: 0
+
+      - uses: reqio-app/feedback-to-pr@v2
         with:
           project-id: YOUR_PROJECT_ID
           base-url: https://reqio.app

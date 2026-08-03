@@ -11,6 +11,7 @@ import {
   setDeveloperNoteAgentSection,
   setStatus,
   emitAgentEvent,
+  claimAgentLoop,
 } from "./reqio.mjs";
 import { buildBrief, buildReviewBrief } from "./prompt.mjs";
 
@@ -92,6 +93,42 @@ const setOutput = (key, value) => {
 };
 
 const bool = (raw) => String(raw).toLowerCase() === "true";
+
+// ---------------------------------------------------------------------------
+// quota claim helpers (ADR 0021) - shared by poll mode's real claim and
+// verify mode's dry run
+// ---------------------------------------------------------------------------
+
+const CLAIM_SKIP_REASONS = {
+  loop_quota_exhausted: "this month's agent-loop quota is used up",
+  agent_paused: "the agent is paused for this project",
+  feature_not_found: "the request was removed before the claim went through",
+  request_failed: "could not reach the claim endpoint",
+  malformed_response: "the claim endpoint returned an unexpected response",
+};
+
+const describeQuota = (quota) => {
+  if (!quota) return "quota unknown";
+  if (quota.limit === null) return `${quota.used} used this period (unmetered)`;
+  return `${quota.used}/${quota.limit} used this period, resets ${quota.resetsAt}`;
+};
+
+const appendJobSummary = (line) => {
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
+};
+
+/**
+ * One line, always, for a candidate the claim endpoint declined - the job
+ * summary is what a customer reads when they do not go digging in the raw
+ * log, and it has to say why on its own: the reason and where their quota
+ * stands, never just "skipped".
+ */
+const logSkippedClaim = (featureId, result) => {
+  const reason = CLAIM_SKIP_REASONS[result.reason] ?? result.reason ?? "not claimed";
+  const detail = result.error ? ` (${result.error})` : "";
+  console.log(`[reqio] ${featureId} skipped: ${reason}${detail} - ${describeQuota(result.quota)}`);
+  appendJobSummary(`- Skipped \`${featureId}\`: ${reason}${detail} - ${describeQuota(result.quota)}`);
+};
 
 // ---------------------------------------------------------------------------
 // merged mode: a human merged the agent's PR, so tell the reporter
@@ -392,6 +429,38 @@ const handleOne = async (cfg, summary, opts) => {
   if (!isWorkable(feature)) {
     console.log(`[reqio] ${summary.id} is neither a bug nor briefed, skipping.`);
     return false;
+  }
+
+  /**
+   * ADR 0021's claim/reserve call, placed here rather than immediately after
+   * the branch check above or immediately before the model runs below.
+   *
+   * Not right after the branch check: that check only proves nobody has
+   * attempted this request yet. isWorkable is what separates a genuine
+   * candidate from ordinary FEATURE/FEEDBACK backlog noise sitting In
+   * progress for unrelated reasons, and claiming any earlier would spend one
+   * unit of quota on every one of those, once each, for as long as they sit
+   * In progress - a customer's own untriaged backlog would eat their meter
+   * before the agent ever did anything.
+   *
+   * Not right before runAgent: the auto-approve flip below is what tells the
+   * reporter work has started (ADR 0012's IN_PROGRESS notification), and a
+   * customer must never hear that before the run has confirmed there is
+   * quota to actually do it. Rejecting after that notification already went
+   * out is a smaller version of the exact failure mode this design exists to
+   * prevent.
+   *
+   * A repeat claim on an already-claimed feature (a resume, or another round
+   * of review questions) is free server-side (`alreadyCounted: true`), so
+   * this call is unconditional rather than gated on first-attempt state.
+   */
+  const quotaClaim = await claimAgentLoop(cfg, summary.id);
+  if (quotaClaim.claimed !== true) {
+    logSkippedClaim(summary.id, quotaClaim);
+    return false;
+  }
+  if (quotaClaim.alreadyCounted === false) {
+    console.log(`[reqio] ${summary.id} claimed - ${describeQuota(quotaClaim.quota)}`);
   }
 
   // Auto mode picks up work nobody has moved yet, so the agent moves it itself.
@@ -911,9 +980,88 @@ const runReview = async (cfg) => {
   setOutput("handled", "1");
 };
 
+// ---------------------------------------------------------------------------
+// verify mode: the free, no-op setup check (ADR 0021)
+// ---------------------------------------------------------------------------
+
+/**
+ * Exercises the whole path a real poll run takes, minus everything that
+ * costs anything: no git, no model, no pull request, and the claim call is a
+ * dry run that reserves nothing. This is the button the README and the
+ * dashboard tell a new customer to press first, before they trust the
+ * scheduled job with their monthly quota - so a failure here has to name
+ * exactly which step broke, not just that something did.
+ *
+ * Deliberately no git and no checkout: the generated verify job does not run
+ * actions/checkout at all (see the dashboard's workflow-snippets.ts), so
+ * nothing here may assume a working tree exists.
+ */
+const runVerify = async (cfg) => {
+  const results = [];
+  const step = async (label, fn) => {
+    try {
+      results.push({ label, ok: true, detail: await fn() });
+    } catch (error) {
+      results.push({ label, ok: false, detail: error.message });
+    }
+  };
+
+  let candidates = [];
+  await step("authenticate and list in-progress requests", async () => {
+    candidates = await listFeatures(cfg, { status: "IN_PROGRESS" });
+    return `found ${candidates.length}`;
+  });
+  const listedOk = results[0].ok;
+
+  await step("fetch one request and its screenshot", async () => {
+    if (!listedOk) return "skipped, the previous step already failed";
+    if (candidates.length === 0) return "skipped, nothing In progress yet";
+    const feature = await getFeature(cfg, candidates[0].id);
+    const screenshot = await getScreenshot(cfg, candidates[0].id);
+    return `read "${feature.title}"${screenshot ? " with its screenshot" : " (no screenshot attached)"}`;
+  });
+
+  // The dry-run branch is checked server-side before the feature-existence
+  // lookup, on purpose: verify proves connectivity, scope and quota, not one
+  // sample feature (see agentClaimApiSchema / claimAgentLoop server-side).
+  // A placeholder id keeps this step meaningful even for a brand new project
+  // with nothing In progress to sample yet.
+  const sampleFeatureId = listedOk && candidates.length > 0 ? candidates[0].id : "reqio-verify";
+
+  await step("reserve this month's quota (dry run)", async () => {
+    const result = await claimAgentLoop(cfg, sampleFeatureId, { dryRun: true });
+    if (result.claimed === false && result.reason !== "dry_run_ok") {
+      // 403 here is overwhelmingly the same cause: the key predates
+      // agent:claim. Name it, because a bare "FORBIDDEN" sends someone
+      // straight to a support thread instead of Settings -> API.
+      const scopeHint = /\b403\b|FORBIDDEN/.test(result.error ?? "")
+        ? " REQIO_API_KEY is missing the agent:claim scope - re-mint it at Project -> Settings -> API with agent:claim included."
+        : "";
+      throw new Error(`${result.error ?? CLAIM_SKIP_REASONS[result.reason] ?? result.reason}.${scopeHint}`);
+    }
+    return describeQuota(result.quota);
+  });
+
+  const passed = results.every((r) => r.ok);
+  console.log("");
+  console.log(passed ? "[reqio] verify passed - the plumbing works." : "[reqio] verify FAILED");
+  for (const r of results) console.log(`  ${r.ok ? "PASS" : "FAIL"}  ${r.label}: ${r.detail}`);
+
+  appendJobSummary(`## Reqio agent verify - ${passed ? "PASS" : "FAIL"}`);
+  appendJobSummary("");
+  for (const r of results) appendJobSummary(`- ${r.ok ? "PASS" : "FAIL"} **${r.label}** - ${r.detail}`);
+
+  setOutput("handled", "0");
+  if (!passed) {
+    const failed = results.find((r) => !r.ok);
+    throw new Error(`verify failed at "${failed.label}": ${failed.detail}`);
+  }
+};
+
 const main = async () => {
   const cfg = config();
   const mode = process.env.REQIO_MODE || "poll";
+  if (mode === "verify") return runVerify(cfg);
   if (mode === "merged") return runMerged(cfg);
   if (mode === "review") return runReview(cfg);
   return runPoll(cfg);

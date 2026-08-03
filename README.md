@@ -40,11 +40,15 @@ Your Reqio dashboard generates both workflow files pre-filled for your project: 
 
 If you would rather write them by hand, see [`examples/`](./examples).
 
+### Run verify first
+
+The generated poll workflow ships a second job, `verify`, gated on `workflow_dispatch` with `mode: verify`. Run it from the Actions tab before you trust the schedule with anything. It authenticates, lists what's currently In progress, reads one request and its screenshot, and checks this month's quota, in that order, and it never touches your model or spends a loop doing it. If a step fails, the job summary names exactly which one, so you fix your setup before the schedule wastes an unattended run finding the same thing out.
+
 ### Secrets
 
 | Secret | What it is |
 |---|---|
-| `REQIO_API_KEY` | A project API key from Project → Settings → API. Needs `backlog:read`, `conversations:read`, `notes:write`, `status:write`. |
+| `REQIO_API_KEY` | A project API key from Project → Settings → API. Needs `backlog:read`, `conversations:read`, `notes:write`, `status:write`, `agent:claim`. A key minted before `agent:claim` existed does not have it - re-mint it at Settings → API and update the secret. `verify` names this exact problem when it is the cause. |
 | `ANTHROPIC_API_KEY` | The coding agent's model key. Swap the name if you use `agent-command` to run a different agent. |
 
 Both are used only inside your own runner. Reqio never sees the model key, and the model never sees your Reqio key.
@@ -53,6 +57,7 @@ Both are used only inside your own runner. Reqio never sees the model key, and t
 
 | Input | Default | Notes |
 |---|---|---|
+| `mode` | `poll` | `poll` (the schedule), `verify` (dry run, see above), `review`, or `merged`. The generated workflows set this for you. |
 | `project-id` | required | Your Reqio project id. |
 | `base-url` | `https://reqio.app` | No trailing slash. |
 | `auto-approve` | `false` | `false`: only bugs your team moved to In progress. `true`: also picks up new bugs, and the pull request becomes the only approval. |
@@ -63,6 +68,24 @@ Both are used only inside your own runner. Reqio never sees the model key, and t
 | `base-branch` | repo default | Branch to cut from. |
 | `pr-number` | empty | Review mode only. The pull request that was reviewed. |
 | `completion-kind` | `NEXT_UPDATE` | Merge mode only. `SHIPPED` if merging deploys for you. |
+
+## Monthly quota
+
+Every plan includes a monthly number of agent loops, pooled across every project you own - Free is 10, and it is enough to run this end to end on a hobby project. Before the model runs, poll mode reserves one unit of that quota for the request it is about to work on. Reserving is free the second time: resuming a draft or answering a round of review questions on a request you already claimed never counts again.
+
+**Running out is not a failure.** If a request would put you over quota, or the agent is paused for that project, the action skips it, writes one line to the job summary saying why and where your quota stands, and moves to the next candidate. The run still finishes green. A red run in your CI over a free-tier limit would be Reqio's mistake, not yours, so it never happens - check the job summary, not the run status, to see what got skipped. Settings → Agent on your dashboard shows the same number live.
+
+## Upgrading from v1
+
+`v1` predates the quota above. It never calls the claim endpoint, does not support `verify`, and is not metered - Reqio counts its pull requests softly, for visibility only, and never rejects one. It is frozen: existing workflows pinned to `reqio-app/feedback-to-pr@v1` keep working exactly as they always have, with no quota enforcement, whether or not you touch them.
+
+`v2` is additive on top of it - same inputs, same modes, same behaviour for everything except the two changes above. To move onto it:
+
+1. Point your workflow files at `reqio-app/feedback-to-pr@v2` instead of `@v1`.
+2. Re-mint `REQIO_API_KEY` with the `agent:claim` scope included (see Secrets above).
+3. Run `verify` once from the Actions tab to confirm both landed.
+
+Nothing else changes. There is no reason to stay on `v1` once `agent:claim` is on your key, and every new setup generated from the dashboard already targets `v2`.
 
 ## Asking the agent for changes
 

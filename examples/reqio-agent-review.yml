@@ -1,5 +1,10 @@
 name: Reqio agent (review)
 
+# Unaffected by the @v2 quota claim - review mode amends a pull request whose
+# request was already claimed when it first opened, so it never claims again.
+# See the README's "Upgrading from v1" for what @v2 changes and why it is
+# still safe to move onto here.
+
 # Three places a human can leave feedback on a pull request, three different
 # GitHub events. Subscribing to fewer than all three means the agent silently
 # ignores feedback depending on which box the reviewer happened to type into.
@@ -65,9 +70,9 @@ jobs:
       )
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: reqio-app/feedback-to-pr@v1
+      - uses: reqio-app/feedback-to-pr@v2
         with:
           mode: review
           pr-number: ${{ github.event.issue.number || github.event.pull_request.number }}

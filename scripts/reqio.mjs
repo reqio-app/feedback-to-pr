@@ -133,3 +133,32 @@ export const emitAgentEvent = async (cfg, payload) => {
     console.warn(`[reqio] agent event ${payload.kind} not delivered: ${error.message}`);
   }
 };
+
+/**
+ * ADR 0021's claim/reserve call. The server's contract promises this
+ * endpoint always answers HTTP 200 with one of its documented shapes, but
+ * that is a promise about the server, not about the network between here and
+ * it: a proxy 502, a timeout, or a body that fails to parse never reaches
+ * that contract at all. Both a clean decline and an unreachable endpoint
+ * collapse to the same `{ claimed: false }` shape here, with a synthetic
+ * `reason` the caller can log, because "the server said no" and "the server
+ * could not be reached" have to be handled identically by anything about to
+ * spend model tokens on the strength of this response: skip, never crash.
+ *
+ * `featureId` is required by the schema even for a dry run - see
+ * agentClaimApiSchema server-side - but the dry-run branch does not resolve
+ * it against a real feature, so a caller with nothing to test against yet
+ * (verify mode on a brand new project) can pass a placeholder.
+ */
+export const claimAgentLoop = async (cfg, featureId, { dryRun } = {}) => {
+  try {
+    const result = await request(cfg, "POST", "/agent-claims", {
+      featureId,
+      ...(dryRun ? { dryRun: true } : {}),
+    });
+    if (result && typeof result.claimed === "boolean") return result;
+    return { claimed: false, reason: "malformed_response", quota: null };
+  } catch (error) {
+    return { claimed: false, reason: "request_failed", quota: null, error: error.message };
+  }
+};
