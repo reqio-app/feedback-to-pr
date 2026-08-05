@@ -42,6 +42,46 @@ const QUESTIONS_FILE = path.join(WORK_DIR, "questions.md");
  */
 const AGENT_SECTION_MARKER = "## Reqio agent";
 const QUESTIONS_MARKER = "### Questions for the reporter";
+const ATTEMPTS_MARKER = "Attempts:";
+
+/**
+ * How many times this action will invoke the model on one request before it
+ * stops and waits for a person.
+ *
+ * Without a ceiling, a request whose run produced neither code nor questions
+ * came back on EVERY poll, forever. Each guard has a hole the others do not
+ * cover: a draft pull request is deliberately not a claim (so it stays
+ * retryable), the questions hold only engages if questions were actually
+ * written, the empty-attempt guard only fires when the PREVIOUS attempt had
+ * code, and a repeat claim is free by design. Nothing in that chain stops an
+ * agent that crashed, refused, or returned nothing. Worse, `handled` only
+ * increments on success, so stuck requests never counted toward
+ * max-prs-per-run either: N stuck requests meant N model invocations per poll,
+ * uncapped, which is the one place "infinite retry loop" genuinely applied.
+ *
+ * The failure modes are open-ended, so this is a plain attempt count rather
+ * than a fix aimed at any one of them. It lives in this action's own zone of
+ * the developer note, which the server splices under a row lock, so it
+ * survives between runs with no new state anywhere.
+ */
+const MAX_ATTEMPTS = Math.max(1, Number(process.env.REQIO_MAX_ATTEMPTS || "3"));
+
+/** Reads the attempt count this action recorded on its previous run. */
+const attemptsSoFar = (feature) => {
+  const { agent } = splitAgentSection(feature.developerNote);
+  if (!agent) return 0;
+  const line = agent.split("\n").find((l) => l.trim().startsWith(ATTEMPTS_MARKER));
+  if (!line) return 0;
+  const n = Number(line.trim().slice(ATTEMPTS_MARKER.length).split("/")[0].trim());
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
+/**
+ * True once a request has burned its attempts. Deliberately NOT a status
+ * change or a claim refund: a human should still find the request where they
+ * left it, with the note saying why the agent stopped touching it.
+ */
+const isAttemptExhausted = (feature) => attemptsSoFar(feature) >= MAX_ATTEMPTS;
 
 /** Splits a raw note into what the human wrote and what this action wrote. */
 const splitAgentSection = (note) => {
@@ -428,17 +468,49 @@ const hasCodeChanges = () => {
   return status.ok && status.out !== "";
 };
 
+const isTestPath = (file) =>
+  /(^|\/)(tests?|__tests__|spec)\//.test(file) || /\.(test|spec)\.[a-z]+$/.test(file);
+
+/**
+ * core.quotePath=false so a path with non-ASCII characters comes back as raw
+ * UTF-8 rather than `"tests/\303\251.test.ts"`. The quoted form matches no
+ * filename on disk, so it silently slipped past both the filter and the
+ * restore below.
+ */
+const gitPaths = (args) => {
+  const res = shQuiet(`git -c core.quotePath=false ${args}`);
+  return res.ok && res.out ? res.out.split("\n").filter(Boolean) : [];
+};
+
+/**
+ * Puts the test suite back the way the repository had it.
+ *
+ * `git diff` only reports files git already tracks, so this used to enforce
+ * "do not modify existing test files" and nothing more. Adding a NEW one was
+ * untouched - and adding is the easier way to get the same result, because the
+ * runner globs test files rather than listing them. A new
+ * `tests/zz-setup.test.ts` that stubs a module, or any file the suite
+ * auto-loads, changes what the whole suite proves. The pull request body then
+ * reports "Passed inside the agent job" on the strength of it, and that line is
+ * the only check a reviewer gets, since GitHub does not run their CI on this
+ * branch.
+ *
+ * The delete happens before `test-command` runs, so the suite that reports back
+ * is the repository's own.
+ */
 const restoreTestFiles = () => {
-  const changed = shQuiet("git diff --name-only");
-  if (!changed.ok || !changed.out) return [];
-  const testFiles = changed.out
-    .split("\n")
-    .filter((f) => /(^|\/)(tests?|__tests__|spec)\//.test(f) || /\.(test|spec)\.[a-z]+$/.test(f));
+  const modified = gitPaths("diff --name-only").filter(isTestPath);
+  const added = gitPaths("ls-files --others --exclude-standard").filter(isTestPath);
+
   // argv, not a shell string: the agent chooses these filenames, and an agent
   // acting on an injected instruction can create one containing shell
   // metacharacters purely to get it executed here.
-  for (const file of testFiles) run("git", ["checkout", "--", file]);
-  return testFiles;
+  for (const file of modified) run("git", ["checkout", "--", file]);
+  // A file git has never seen has no version to check out back to. Paths come
+  // from git itself, so they are repository-relative and cannot climb out.
+  for (const file of added) rmSync(file, { force: true });
+
+  return [...modified, ...added];
 };
 
 /**
@@ -576,6 +648,19 @@ const handleOne = async (cfg, summary, opts) => {
 
   if (isWaitingOnReporter(feature, thread)) {
     console.log(`[reqio] ${summary.id} is waiting on an answer to the agent's questions, skipping.`);
+    return false;
+  }
+
+  // The backstop the other guards do not provide. Checked here, after the
+  // detail fetch and before the model is invoked, so an exhausted request
+  // costs one cheap read per poll instead of a model run. It never expires on
+  // its own: a person has to look, because by definition the automation has
+  // already failed at this three times.
+  if (isAttemptExhausted(feature)) {
+    console.log(
+      `[reqio] ${summary.id} has used its ${MAX_ATTEMPTS} agent attempts without landing a fix. ` +
+        `Skipping until a human looks at it. Clear the Attempts line in the request's Context to retry.`,
+    );
     return false;
   }
 
@@ -746,7 +831,9 @@ const handleOne = async (cfg, summary, opts) => {
   // preserved by the server, which splices inside a row lock. The previous
   // whole-note PATCH destroyed the spec a human had written the moment a pull
   // request opened, which is also what made briefed requests unresumable.
+  const attemptNo = attemptsSoFar(feature) + 1;
   const agentSection = [
+    `${ATTEMPTS_MARKER} ${attemptNo}/${MAX_ATTEMPTS}`,
     `${questions ? "Draft pull" : "Pull"} request: ${prUrl}`,
     ...(questions ? ["", QUESTIONS_MARKER, questions] : []),
   ].join("\n");
