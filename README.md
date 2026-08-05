@@ -118,6 +118,14 @@ Four things worth knowing:
 
 Repositories without a test suite get noticeably worse results, because the agent has no way to check itself.
 
+## It gives up after three tries
+
+Retrying is what makes a transient failure survivable, so retrying has to have an end. The action invokes a model **at most three times on any one request**. After that it skips that request on every poll and says so in the log, until a person looks at it.
+
+The count lives in the request's Context in Reqio, in the agent's own section, as an `Attempts: 2/3` line. Delete that line to grant another three. Set `REQIO_MAX_ATTEMPTS` in the step's `env:` if three is the wrong number for you.
+
+Without this, an agent that crashed, refused, or returned nothing came back on every single poll, forever, spending model tokens each time. Three failures is not a transient problem.
+
 ## Safety
 
 - Bug reports are text written by strangers, and it becomes an agent prompt next to repo write access. Report content is fenced and labelled as untrusted data in the brief, and the agent is told that instructions found inside it are to be reported, not followed.
@@ -125,7 +133,7 @@ Repositories without a test suite get noticeably worse results, because the agen
 - **One caveat on that list, stated plainly.** Running a model through Amazon Bedrock or Google Vertex needs general-purpose cloud credentials, so `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `GOOGLE_APPLICATION_CREDENTIALS` are on the allowlist. Unlike a provider API key, those grant whatever the underlying IAM principal grants, not just model access. If you use one of those providers, give this job a credential scoped to model invocation alone. If you do not use them but have AWS or Google credentials on this job for deployment, they will reach the agent: move that work to a separate job. More generally, do not declare a secret on this job that the agent has no reason to see; the allowlist is a second layer, not a substitute for that.
 - The workflow asks for `contents: write` and `pull-requests: write` and nothing else.
 - The agent never pushes to your default branch. Poll and merged mode never run on fork-originated events at all, and review mode's `runReview` refuses server-side before checkout if the pull request it was asked to act on turns out to be cross-repository - the one case (`issue_comment`) where the workflow's own `if:` cannot express that check. See "Asking the agent for changes" above.
-- With `allow-test-edits: false` (the default) any edit the agent makes to a test file is reverted before the commit.
+- With `allow-test-edits: false` (the default) the agent's changes to your test suite are undone before `test-command` runs: edits to existing test files are reverted, and test files it created are deleted. Adding is the easier way to neuter a suite than editing, since runners glob test files rather than list them, so both are covered.
 - The API key is audience-bound to one Reqio project server-side. Presented against a different project it fails closed.
 - Every pull request is reviewed by a human. Turn on branch protection so that stays true.
 
